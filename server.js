@@ -1,99 +1,417 @@
-const express=require("express");
-const http=require("http");
-const WebSocket=require("ws");
-const fs=require("fs");
-const path=require("path");
 
-const app=express();
-const server=http.createServer(app);
-const wss=new WebSocket.Server({server});
-const PORT=Number(process.env.PORT||3000);
-const DB=path.join(__dirname,"data.json");
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const crypto = require("crypto");
+const path = require("path");
 
-app.use(express.json({limit:"12mb"}));
-app.use(express.static(path.join(__dirname,"public")));
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+const PORT = Number(process.env.PORT || 3000);
 
-let db={users:[],messages:[]};
-function save(){fs.writeFileSync(DB,JSON.stringify(db,null,2));}
-function load(){try{db=JSON.parse(fs.readFileSync(DB,"utf8"));if(!Array.isArray(db.users))db.users=[];if(!Array.isArray(db.messages))db.messages=[];}catch{db={users:[],messages:[]};save();}}
-load();
+app.use(express.json({ limit: "12mb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
-const clean=v=>String(v??"").trim();
-const send=(ws,x)=>{if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify(x));};
-const online=u=>{let ok=false;wss.clients.forEach(c=>{if(c.username===u)ok=true});return ok;};
-const publicUsers=()=>db.users.map(u=>({username:u.username,name:u.name||u.username,bio:u.bio||"",avatar:u.avatar||"",online:online(u.username)}));
-const broadcast=x=>wss.clients.forEach(c=>send(c,x));
-const validUsername=u=>/^[A-Za-z0-9_.-]{3,32}$/.test(u);
+const URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-app.get("/api/health",(req,res)=>res.json({ok:true,version:"4.1.0",users:db.users.length,messages:db.messages.length}));
-app.get("/api/users",(req,res)=>res.json(publicUsers()));
+async function db(table, options = {}) {
+  if (!URL || !KEY) throw Error("Supabase environment variables missing");
 
-app.post("/api/register",(req,res)=>{
- const username=clean(req.body.username),password=String(req.body.password||"");
- if(!validUsername(username))return res.json({error:"نام کاربری ۳ تا ۳۲ کاراکتر و فقط حروف انگلیسی، عدد، نقطه، - یا _ باشد."});
- if(password.length<4)return res.json({error:"رمز حداقل ۴ کاراکتر باشد."});
- if(db.users.some(u=>u.username.toLowerCase()===username.toLowerCase()))return res.json({error:"این نام کاربری وجود دارد."});
- db.users.push({username,password,name:username,bio:"",avatar:""});save();
- res.json({success:true,username});
+  const response = await fetch(
+    `${URL}/rest/v1/${table}${options.query ? "?" + options.query : ""}`,
+    {
+      method: options.method || "GET",
+      headers: {
+        apikey: KEY,
+        Authorization: `Bearer ${KEY}`,
+        "Content-Type": "application/json",
+        Prefer: options.prefer || "return=representation"
+      },
+      ...(options.body !== undefined
+        ? { body: JSON.stringify(options.body) }
+        : {})
+    }
+  );
+
+  const text = await response.text();
+  let data = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    console.error("Supabase error:", data);
+    throw Error(data?.message || `Supabase HTTP ${response.status}`);
+  }
+
+  return data;
+}
+
+const clean = v => String(v ?? "").trim();
+const enc = v => encodeURIComponent(String(v));
+const validUsername = u => /^[A-Za-z0-9_.-]{3,32}$/.test(u);
+
+const send = (ws, data) => {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+};
+
+const online = username =>
+  [...wss.clients].some(c =>
+    c.username === username && c.readyState === WebSocket.OPEN
+  );
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `scrypt:${salt}:${hash}`;
+}
+
+function checkPassword(password, stored) {
+  try {
+    const [scheme, salt, hash] = stored.split(":");
+    if (scheme !== "scrypt") return false;
+    const actual = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(hash, "hex");
+    return actual.length === expected.length &&
+      crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
+async function users() {
+  return await db("users", {
+    query: "select=username,display_name,bio,avatar&order=created_at.asc"
+  }) || [];
+}
+
+function publicUser(u) {
+  return {
+    username: u.username,
+    name: u.display_name || u.username,
+    bio: u.bio || "",
+    avatar: u.avatar || "",
+    online: online(u.username)
+  };
+}
+
+async function broadcastUsers() {
+  try {
+    const list = (await users()).map(publicUser);
+    wss.clients.forEach(c => send(c, { type: "users", users: list }));
+  } catch (e) {
+    console.error("Users broadcast:", e.message);
+  }
+}
+
+app.get("/api/health", async (req, res) => {
+  try {
+    await db("users", { query: "select=username&limit=1" });
+    await db("messages", { query: "select=id&limit=1" });
+    res.json({ ok: true, database: "supabase", connected: true });
+  } catch (e) {
+    res.status(503).json({
+      ok: false,
+      database: "supabase",
+      connected: false,
+      error: e.message
+    });
+  }
 });
 
-app.post("/api/login",(req,res)=>{
- const username=clean(req.body.username),password=String(req.body.password||"");
- const u=db.users.find(x=>x.username.toLowerCase()===username.toLowerCase()&&x.password===password);
- if(!u)return res.json({error:"نام کاربری یا رمز اشتباه است."});
- res.json({success:true,username:u.username});
+app.get("/api/users", async (req, res) => {
+  try {
+    res.json((await users()).map(publicUser));
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "خطا در اتصال به دیتابیس کاربران." });
+  }
 });
 
-app.get("/api/messages",(req,res)=>{
- const a=clean(req.query.a),b=clean(req.query.b);
- res.json(db.messages.filter(m=>(m.from===a&&m.to===b)||(m.from===b&&m.to===a)).slice(-500));
+app.post("/api/register", async (req, res) => {
+  try {
+    const username = clean(req.body.username);
+    const password = String(req.body.password || "");
+
+    if (!validUsername(username)) {
+      return res.json({ error: "نام کاربری باید ۳ تا ۳۲ کاراکتر انگلیسی باشد." });
+    }
+
+    if (password.length < 4) {
+      return res.json({ error: "رمز حداقل ۴ کاراکتر باشد." });
+    }
+
+    const existing = await db("users", {
+      query: `select=username&username=ilike.${enc(username)}&limit=1`
+    });
+
+    if (existing.length) {
+      return res.json({ error: "این نام کاربری وجود دارد." });
+    }
+
+    await db("users", {
+      method: "POST",
+      body: {
+        username,
+        password_hash: hashPassword(password),
+        display_name: username,
+        bio: "",
+        avatar: ""
+      }
+    });
+
+    res.json({ success: true, username });
+    broadcastUsers();
+  } catch (e) {
+    console.error("Register:", e.message);
+    res.status(503).json({
+      error: "ثبت‌نام ناموفق بود. تنظیمات Supabase و جدول users را بررسی کن."
+    });
+  }
 });
 
-app.post("/api/messages",(req,res)=>{
- const from=clean(req.body.from),to=clean(req.body.to);
- const text=clean(req.body.text),image=String(req.body.image||""),audio=String(req.body.audio||"");
- if(!from||!to)return res.json({error:"مخاطب انتخاب نشده."});
- if(!db.users.some(u=>u.username===from))return res.json({error:"فرستنده پیدا نشد. دوباره وارد شو."});
- if(!db.users.some(u=>u.username===to))return res.json({error:"مخاطب پیدا نشد. از فهرست کاربران انتخابش کن."});
- if(!text&&!image&&!audio)return res.json({error:"پیام خالی است."});
- if(image.length>3000000)return res.json({error:"عکس خیلی بزرگ است."});
- if(audio.length>8000000)return res.json({error:"ویس خیلی بزرگ است."});
- const m={id:Date.now().toString(36)+Math.random().toString(36).slice(2),from,to,text,image,audio,reactions:{},time:new Date().toISOString(),read:false};
- db.messages.push(m);if(db.messages.length>20000)db.messages=db.messages.slice(-20000);save();
- wss.clients.forEach(c=>{if(c.username===from||c.username===to)send(c,{type:"message",message:m});});
- res.json({success:true,message:m});
+app.post("/api/login", async (req, res) => {
+  try {
+    const username = clean(req.body.username);
+    const password = String(req.body.password || "");
+
+    const rows = await db("users", {
+      query: `select=username,password_hash&username=ilike.${enc(username)}&limit=1`
+    });
+
+    const user = rows[0];
+
+    if (!user || !checkPassword(password, user.password_hash)) {
+      return res.json({ error: "نام کاربری یا رمز اشتباه است." });
+    }
+
+    res.json({ success: true, username: user.username });
+  } catch (e) {
+    console.error("Login:", e.message);
+    res.status(503).json({ error: "ورود انجام نشد؛ اتصال دیتابیس را بررسی کن." });
+  }
 });
 
-app.post("/api/read",(req,res)=>{
- const from=clean(req.body.from),to=clean(req.body.to);
- db.messages.forEach(m=>{if(m.from===from&&m.to===to)m.read=true});save();broadcast({type:"read",from,to});res.json({success:true});
+app.get("/api/messages", async (req, res) => {
+  try {
+    const a = clean(req.query.a);
+    const b = clean(req.query.b);
+
+    if (!a || !b) return res.json([]);
+
+    const query =
+      "select=id,sender_username,receiver_username,message_text,image_data,audio_data,reactions,created_at,is_read" +
+      `&or=(and(sender_username.eq.${enc(a)},receiver_username.eq.${enc(b)}),and(sender_username.eq.${enc(b)},receiver_username.eq.${enc(a)}))` +
+      "&order=created_at.asc&limit=500";
+
+    const rows = await db("messages", { query });
+
+    res.json(rows.map(m => ({
+      id: m.id,
+      from: m.sender_username,
+      to: m.receiver_username,
+      text: m.message_text || "",
+      image: m.image_data || "",
+      audio: m.audio_data || "",
+      reactions: m.reactions || {},
+      time: m.created_at,
+      read: !!m.is_read
+    })));
+  } catch (e) {
+    console.error("Messages:", e.message);
+    res.status(503).json({ error: "دریافت پیام‌ها ناموفق بود." });
+  }
 });
 
-app.post("/api/react",(req,res)=>{
- const id=clean(req.body.id),emoji=String(req.body.emoji||""),username=clean(req.body.username);
- const m=db.messages.find(x=>x.id===id);if(!m)return res.json({error:"پیام پیدا نشد."});
- m.reactions=m.reactions||{};
- Object.keys(m.reactions).forEach(e=>m.reactions[e]=(m.reactions[e]||[]).filter(x=>x!==username));
- if(emoji!=="none"){m.reactions[emoji]=m.reactions[emoji]||[];m.reactions[emoji].push(username)}
- save();broadcast({type:"reaction",id,reactions:m.reactions});res.json({success:true});
+app.post("/api/messages", async (req, res) => {
+  try {
+    const from = clean(req.body.from);
+    const to = clean(req.body.to);
+    const text = clean(req.body.text);
+    const image = String(req.body.image || "");
+    const audio = String(req.body.audio || "");
+
+    if (!from || !to) return res.json({ error: "مخاطب انتخاب نشده." });
+    if (!text && !image && !audio) return res.json({ error: "پیام خالی است." });
+    if (image.length > 3000000) return res.json({ error: "عکس خیلی بزرگ است." });
+    if (audio.length > 8000000) return res.json({ error: "ویس خیلی بزرگ است." });
+
+    const found = await db("users", {
+      query: `select=username&or=(username.eq.${enc(from)},username.eq.${enc(to)})`
+    });
+
+    const names = new Set(found.map(u => u.username));
+    if (!names.has(from)) return res.json({ error: "فرستنده پیدا نشد." });
+    if (!names.has(to)) return res.json({ error: "مخاطب پیدا نشد." });
+
+    const inserted = await db("messages", {
+      method: "POST",
+      body: {
+        id: Date.now().toString(36) + crypto.randomBytes(8).toString("hex"),
+        sender_username: from,
+        receiver_username: to,
+        message_text: text,
+        image_data: image,
+        audio_data: audio,
+        reactions: {},
+        is_read: false
+      }
+    });
+
+    const m = inserted[0];
+    const message = {
+      id: m.id,
+      from: m.sender_username,
+      to: m.receiver_username,
+      text: m.message_text || "",
+      image: m.image_data || "",
+      audio: m.audio_data || "",
+      reactions: m.reactions || {},
+      time: m.created_at,
+      read: !!m.is_read
+    };
+
+    wss.clients.forEach(c => {
+      if (c.username === from || c.username === to) {
+        send(c, { type: "message", message });
+      }
+    });
+
+    res.json({ success: true, message });
+  } catch (e) {
+    console.error("Send message:", e.message);
+    res.status(503).json({ error: "ذخیره پیام ناموفق بود." });
+  }
 });
 
-app.get("/api/profile",(req,res)=>{
- const u=db.users.find(x=>x.username===clean(req.query.username));
- if(!u)return res.status(404).json({error:"کاربر پیدا نشد."});
- res.json({username:u.username,name:u.name||u.username,bio:u.bio||"",avatar:u.avatar||""});
-});
-app.post("/api/profile",(req,res)=>{
- const u=db.users.find(x=>x.username===clean(req.body.username));
- if(!u)return res.json({error:"کاربر پیدا نشد."});
- u.name=clean(req.body.name)||u.username;u.bio=String(req.body.bio||"").slice(0,200);u.avatar=String(req.body.avatar||"");
- if(u.avatar.length>1800000)return res.json({error:"عکس خیلی بزرگ است."});
- save();broadcast({type:"users",users:publicUsers()});res.json({success:true});
+app.post("/api/read", async (req, res) => {
+  try {
+    const from = clean(req.body.from);
+    const to = clean(req.body.to);
+
+    await db("messages", {
+      method: "PATCH",
+      query: `sender_username=eq.${enc(from)}&receiver_username=eq.${enc(to)}`,
+      body: { is_read: true },
+      prefer: "return=minimal"
+    });
+
+    res.json({ success: true });
+    wss.clients.forEach(c => send(c, { type: "read", from, to }));
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "ذخیره وضعیت خوانده‌شدن ناموفق بود." });
+  }
 });
 
-wss.on("connection",ws=>{
- ws.on("message",raw=>{try{const d=JSON.parse(raw);if(d.type==="auth"){const u=clean(d.username);if(db.users.some(x=>x.username===u)){ws.username=u;send(ws,{type:"users",users:publicUsers()});broadcast({type:"users",users:publicUsers()});}}}catch{}});
- ws.on("close",()=>broadcast({type:"users",users:publicUsers()}));
+app.post("/api/react", async (req, res) => {
+  try {
+    const id = clean(req.body.id);
+    const emoji = String(req.body.emoji || "");
+    const username = clean(req.body.username);
+
+    const rows = await db("messages", {
+      query: `select=id,reactions&id=eq.${enc(id)}&limit=1`
+    });
+
+    if (!rows.length) return res.json({ error: "پیام پیدا نشد." });
+
+    const reactions = rows[0].reactions || {};
+
+    for (const key of Object.keys(reactions)) {
+      reactions[key] = (reactions[key] || []).filter(u => u !== username);
+      if (!reactions[key].length) delete reactions[key];
+    }
+
+    if (emoji && emoji !== "none") {
+      reactions[emoji] = reactions[emoji] || [];
+      if (!reactions[emoji].includes(username)) reactions[emoji].push(username);
+    }
+
+    await db("messages", {
+      method: "PATCH",
+      query: `id=eq.${enc(id)}`,
+      body: { reactions },
+      prefer: "return=minimal"
+    });
+
+    res.json({ success: true });
+    wss.clients.forEach(c => send(c, { type: "reaction", id, reactions }));
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "ذخیره واکنش ناموفق بود." });
+  }
 });
 
-server.listen(PORT,"0.0.0.0",()=>console.log(`=== Karen Messenger V4.1 REMOTE ===\nListening on 0.0.0.0:${PORT}`));
+app.get("/api/profile", async (req, res) => {
+  try {
+    const username = clean(req.query.username);
+    const rows = await db("users", {
+      query: `select=username,display_name,bio,avatar&username=eq.${enc(username)}&limit=1`
+    });
+
+    const u = rows[0];
+    if (!u) return res.status(404).json({ error: "کاربر پیدا نشد." });
+
+    res.json({
+      username: u.username,
+      name: u.display_name || u.username,
+      bio: u.bio || "",
+      avatar: u.avatar || ""
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "دریافت پروفایل ناموفق بود." });
+  }
+});
+
+app.post("/api/profile", async (req, res) => {
+  try {
+    const username = clean(req.body.username);
+    const name = clean(req.body.name);
+    const bio = String(req.body.bio || "").slice(0, 200);
+    const avatar = String(req.body.avatar || "");
+
+    if (avatar.length > 1800000) return res.json({ error: "عکس خیلی بزرگ است." });
+
+    const rows = await db("users", {
+      method: "PATCH",
+      query: `username=eq.${enc(username)}`,
+      body: { display_name: name || username, bio, avatar }
+    });
+
+    res.json({ success: true });
+    broadcastUsers();
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "ذخیره پروفایل ناموفق بود." });
+  }
+});
+
+wss.on("connection", ws => {
+  ws.on("message", async raw => {
+    try {
+      const data = JSON.parse(raw);
+      if (data.type !== "auth") return;
+
+      const username = clean(data.username);
+      const rows = await db("users", {
+        query: `select=username&username=eq.${enc(username)}&limit=1`
+      });
+
+      if (!rows.length) return;
+      ws.username = rows[0].username;
+      broadcastUsers();
+    } catch (e) {
+      console.error("WebSocket:", e.message);
+    }
+  });
+
+  ws.on("close", broadcastUsers);
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Karen Messenger V4.1.1 listening on ${PORT}`);
+  if (!URL || !KEY) console.error("Supabase environment variables missing!");
+});
